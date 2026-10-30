@@ -18,6 +18,7 @@ from . import (
     consistency,
     degeneration,
     distribution,
+    generation,
     judge,
     likelihood,
     quality,
@@ -26,17 +27,20 @@ from . import (
     text,
     toy,
 )
+from .generation import GenerationSet, sample_continuations
 from .model import LogitsModel, Model, TokenizedDoc, Tokenizer
-from .quality import QualityIndex, prose_quality_index
-from .suite import GenerationSet, Report, Suite, SuiteConfig, compare
+from .quality import PQI, CompositeIndex, PQIConfig, composite_index, prose_quality_index
+from .suite import Report, Suite, SuiteConfig, compare
 
 __version__ = "0.1.0"
 
 __all__ = [
+    "PQI",
+    "CompositeIndex",
     "GenerationSet",
     "LogitsModel",
     "Model",
-    "QualityIndex",
+    "PQIConfig",
     "Report",
     "Suite",
     "SuiteConfig",
@@ -44,14 +48,17 @@ __all__ = [
     "Tokenizer",
     "__version__",
     "compare",
+    "composite_index",
     "consistency",
     "degeneration",
     "distribution",
+    "generation",
     "judge",
     "likelihood",
     "prose_quality_index",
     "quality",
     "recall",
+    "sample_continuations",
     "stats",
     "text",
     "toy",

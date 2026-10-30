@@ -1,10 +1,10 @@
 """Run every metric under one fixed protocol and produce a comparable report.
 
-:class:`Suite` holds the protocol (document length, context windows, prompt and
-continuation lengths, decoding settings, MAUVE options, optional evaluator and
-judge).  Calling :meth:`Suite.run` on several models with the same suite and the
-same held-out texts gives reports whose numbers -- including the Prose Quality
-Index -- are directly comparable.
+:class:`Suite` holds the protocol: the PQI's :class:`~proseometry.quality.PQIConfig`
+plus the diagnostics-only settings (context-gain windows, LongPPL evaluator
+parameters, optional judge).  Calling :meth:`Suite.run` on several models with
+the same suite and the same held-out texts gives reports whose numbers --
+including the PQI -- are directly comparable.
 """
 
 from __future__ import annotations
@@ -22,7 +22,8 @@ import numpy as np
 
 from .consistency import compare_name_usage
 from .degeneration import SURFACE_STATS, StatComparison, compare_surface
-from .distribution import MauveResult, MissingDependency, mauve_available, mauve_score
+from .distribution import MauveResult, MissingDependency, mauve_available
+from .generation import GenerationSet, sample_continuations
 from .judge import Judge, JudgeResult, judge_continuations
 from .likelihood import (
     ContextGain,
@@ -38,89 +39,26 @@ from .likelihood import (
     mask_from_spans,
 )
 from .model import Model, TokenizedDoc
-from .quality import DEFAULT_FLOOR, DEFAULT_WEIGHTS, QualityIndex, prose_quality_index
+from .quality import PQI, PQIConfig, mauve_for
 from .recall import BindingResult, name_binding
 from .text import NameExtractor, find_names
 
 
 @dataclass
-class SuiteConfig:
-    """The evaluation protocol.  Keep it fixed across the models you compare."""
+class SuiteConfig(PQIConfig):
+    """The PQI protocol plus the suite's diagnostics.  Keep it fixed across compared models."""
 
-    # Teacher-forced metrics -------------------------------------------------
-    max_doc_tokens: int = 1024
-    """Documents are truncated to this many tokens (and to the model's context)."""
     context_windows: tuple[int, ...] = (16, 64, 256)
-    """Short-context sizes ``k`` for the context-gain curve."""
+    """Short-context sizes ``k`` for the context-gain curve (diagnostic, not in the PQI)."""
     short_stride: int = 1
     """1 = exact ``k``-token contexts; larger = cheaper, slightly longer contexts."""
 
-    # LongPPL (requires an evaluator model) ----------------------------------
     long_ppl_k: int = 64
     long_ppl_alpha: float = 2.0
     long_ppl_beta: float = -2.0
+    """LongPPL key-token selection (diagnostic; needs an evaluator model)."""
 
-    # Name binding ------------------------------------------------------------
-    binding_min_gap: int = 64
-    """A name must have been absent for this many tokens to count as a long-range callback."""
-    binding_max_positions: int | None = 32
-    """Cap on probed positions per document (random subset), to bound cost."""
-
-    # Generation --------------------------------------------------------------
-    prompt_tokens: int = 128
-    continuation_tokens: int = 256
-    samples_per_prompt: int = 1
-    max_prompts: int | None = None
-    """Use at most this many eligible documents as prompts (random subset)."""
-    temperature: float = 1.0
-    top_p: float = 0.95
-
-    # MAUVE -------------------------------------------------------------------
-    mauve: bool = True
-    mauve_featurizer: str = "gpt2-large"
-    mauve_device_id: int = -1
-    mauve_max_text_length: int = 512
-    mauve_batch_size: int = 8
-    mauve_include_prompt: bool = True
-    """Score ``prompt + continuation`` (as in the MAUVE paper), not the continuation alone."""
-
-    # Index -------------------------------------------------------------------
-    pqi_weights: Mapping[str, float] = field(default_factory=lambda: dict(DEFAULT_WEIGHTS))
-    pqi_floor: float = DEFAULT_FLOOR
-
-    seed: int = 0
     verbose: bool = True
-
-
-@dataclass
-class GenerationSet:
-    """Prompts with their human and model continuations under one decoding protocol."""
-
-    prompts: list[str]
-    human: list[str]
-    model: list[str]
-    prompt_index: list[int]
-    """``prompt_index[j]`` is the prompt that model sample ``j`` continues."""
-    doc_index: list[int]
-    """Document index of each prompt within the corpus passed to :meth:`Suite.run`."""
-
-    def __len__(self) -> int:
-        return len(self.model)
-
-    def model_prompts(self) -> list[str]:
-        return [self.prompts[i] for i in self.prompt_index]
-
-    def examples(self, n: int = 3) -> str:
-        """A few prompt / human / model triples for eyeballing."""
-        chunks = []
-        for j in range(min(n, len(self.model))):
-            p = self.prompt_index[j]
-            chunks.append(
-                f"--- prompt {p} ---\n{self.prompts[p]}\n"
-                f"--- human ---\n{self.human[p]}\n"
-                f"--- model ---\n{self.model[j]}\n"
-            )
-        return "\n".join(chunks)
 
 
 @dataclass
@@ -137,7 +75,7 @@ class Report:
     name_usage: dict[str, StatComparison]
     mauve: MauveResult | None
     judge: JudgeResult | None
-    pqi: QualityIndex
+    pqi: PQI
     notes: list[str] = field(default_factory=list)
     scores: list[ContextScores] | None = None
 
@@ -157,6 +95,7 @@ class Report:
         return {
             "model": self.model,
             "n_docs": self.n_docs,
+            "pqi": self.pqi.to_dict(),
             "likelihood": {
                 "bits_per_byte": self.likelihood.bits_per_byte,
                 "perplexity": self.likelihood.perplexity,
@@ -202,9 +141,8 @@ class Report:
             "name_usage": comparisons(self.name_usage),
             "mauve": None if self.mauve is None else self.mauve.to_dict(),
             "judge": None if self.judge is None else self.judge.to_dict(),
-            "pqi": self.pqi.to_dict(),
             "notes": list(self.notes),
-            "config": _config_dict(self.config),
+            "config": asdict(self.config),
         }
 
     def to_json(self, **kwargs: Any) -> str:
@@ -259,7 +197,7 @@ class Report:
         if self.judge is not None:
             rows.append(
                 (
-                    "judge (1-5)",
+                    "judge (1-5, not in PQI)",
                     ", ".join(f"{c} {_fmt(self.judge.mean(c), 2)}" for c in self.judge.criteria)
                     + f" (parsed {self.judge.n_parsed}/{len(self.judge.per_sample)})",
                 )
@@ -284,6 +222,7 @@ class Suite:
         not be one of the models being compared.  Omit to skip LongPPL.
     judge:
         Optional ``Callable[[str], str]`` LLM judge (see :mod:`proseometry.judge`).
+        Reported as a diagnostic; never part of the PQI.
     extractor:
         Name detector used by the binding probe and the callback statistics.
     """
@@ -342,44 +281,19 @@ class Suite:
         return self._key_span_cache[key]
 
     def generate(self, model: Model, docs: Sequence[TokenizedDoc]) -> GenerationSet | None:
-        """Sample continuations for every document long enough to supply prompt + reference."""
+        """Sample continuations under the suite's protocol (see :func:`sample_continuations`)."""
         cfg = self.config
-        need = cfg.prompt_tokens + cfg.continuation_tokens
-        limit = model.max_doc_tokens
-        if limit is not None and need > limit:
-            raise ValueError(
-                f"prompt_tokens + continuation_tokens = {need} exceeds the context of "
-                f"{model.name!r} ({limit} tokens excluding BOS); lower them in SuiteConfig"
-            )
-        eligible = [i for i, d in enumerate(docs) if len(d) >= need]
-        if cfg.max_prompts is not None and len(eligible) > cfg.max_prompts:
-            rng = np.random.default_rng(cfg.seed)
-            eligible = sorted(rng.choice(eligible, size=cfg.max_prompts, replace=False).tolist())
-        if not eligible:
-            return None
-        prompts: list[str] = []
-        human: list[str] = []
-        samples: list[str] = []
-        prompt_index: list[int] = []
-        for j, i in enumerate(eligible):
-            doc = docs[i]
-            prompt_ids = doc.ids[: cfg.prompt_tokens]
-            prompt_text = model.decode(prompt_ids)
-            prompts.append(prompt_text)
-            human.append(model.decode(doc.ids[:need])[len(prompt_text) :])
-            for s in range(cfg.samples_per_prompt):
-                out = model.generate(
-                    prompt_ids,
-                    cfg.continuation_tokens,
-                    temperature=cfg.temperature,
-                    top_p=cfg.top_p,
-                    seed=cfg.seed * 7919 + i * 131 + s,
-                )
-                if model.eos_id is not None and model.eos_id in out:
-                    out = out[: out.index(model.eos_id)]
-                samples.append(model.decode(prompt_ids + list(out))[len(prompt_text) :])
-                prompt_index.append(j)
-        return GenerationSet(prompts, human, samples, prompt_index, eligible)
+        return sample_continuations(
+            model,
+            docs,
+            prompt_tokens=cfg.prompt_tokens,
+            continuation_tokens=cfg.continuation_tokens,
+            samples_per_prompt=cfg.samples_per_prompt,
+            max_prompts=cfg.max_prompts,
+            temperature=cfg.temperature,
+            top_p=cfg.top_p,
+            seed=cfg.seed,
+        )
 
     # ------------------------------------------------------------------ main entry
     def run(self, model: Model, texts: Sequence[str], *, name: str | None = None) -> Report:
@@ -448,29 +362,8 @@ class Suite:
             if cfg.mauve:
                 if mauve_available():
                     self._log(f"[{label}] computing MAUVE with {cfg.mauve_featurizer}")
-                    if cfg.mauve_include_prompt:
-                        p_text = [
-                            p + h for p, h in zip(generation.prompts, generation.human, strict=True)
-                        ]
-                        q_text = [
-                            p + m
-                            for p, m in zip(
-                                generation.model_prompts(), generation.model, strict=True
-                            )
-                        ]
-                    else:
-                        p_text, q_text = generation.human, generation.model
                     try:
-                        mauve = mauve_score(
-                            p_text,
-                            q_text,
-                            featurize_model_name=cfg.mauve_featurizer,
-                            device_id=cfg.mauve_device_id,
-                            max_text_length=cfg.mauve_max_text_length,
-                            batch_size=cfg.mauve_batch_size,
-                            seed=cfg.seed + 25,
-                            verbose=False,
-                        )
+                        mauve = mauve_for(generation, cfg)
                     except (RuntimeError, ValueError, MissingDependency) as exc:
                         notes.append(f"MAUVE failed; the rest of the report is unaffected: {exc}")
                     if mauve is not None and len(generation.prompts) < 1000:
@@ -480,7 +373,8 @@ class Suite:
                         )
                 else:
                     notes.append(
-                        "MAUVE skipped: `mauve-text` is not installed (proseometry[mauve])"
+                        "MAUVE skipped: `mauve-text` is not installed (proseometry[mauve]); "
+                        "the PQI is partial"
                     )
             if self.judge is not None:
                 self._log(f"[{label}] judging {len(generation)} continuations")
@@ -488,21 +382,14 @@ class Suite:
                     self.judge, generation.model_prompts(), generation.model
                 )
 
-        pqi = prose_quality_index(
-            realism={
-                "mauve": mauve.mauve if mauve is not None else math.nan,
-                "judge_coherence": judge.normalized("coherence") if judge is not None else math.nan,
-            },
-            surface={f"{k}_overlap": v.overlap for k, v in surface.items()},
-            memory={
-                "binding_skill": binding.skill,
-                **{f"{k}_overlap": v.overlap for k, v in usage.items()},
-                "judge_consistency": judge.normalized("consistency")
-                if judge is not None
-                else math.nan,
-            },
-            weights=cfg.pqi_weights,
-            floor=cfg.pqi_floor,
+        pqi = PQI.from_measurements(
+            binding=binding,
+            surface=surface,
+            name_usage=usage,
+            mauve=mauve,
+            generation=generation,
+            config=cfg,
+            notes=notes,
         )
         self._log(f"[{label}] done: {pqi.summary()}")
         return Report(
@@ -525,12 +412,16 @@ class Suite:
 
 
 def compare(reports: Sequence[Report]) -> str:
-    """One markdown table, one row per report, sorted by PQI."""
-    ordered = sorted(
-        reports, key=lambda r: -r.pqi.score if not math.isnan(r.pqi.score) else math.inf
-    )
+    """One markdown table, one row per report, sorted by PQI (partial indices marked with *)."""
+
+    def rank(r: Report) -> float:
+        value = r.pqi.score if r.pqi.complete else r.pqi.partial_score
+        return -value if not math.isnan(value) else math.inf
+
+    ordered = sorted(reports, key=rank)
     has_long = any(r.long_ppl is not None for r in reports)
     has_mauve = any(r.mauve is not None for r in reports)
+    any_partial = any(not r.pqi.complete for r in reports)
     header = ["model", "PQI", "realism", "surface", "memory", "bits/byte", "PPL"]
     ks = sorted({k for r in reports for k in r.context_gain})
     header += [f"PPL drop @k={k}" for k in ks]
@@ -542,9 +433,10 @@ def compare(reports: Sequence[Report]) -> str:
     lines = ["| " + " | ".join(header) + " |", "|" + "---|" * len(header)]
     for r in ordered:
         c = r.pqi.components
+        pqi_cell = _fmt(r.pqi.score) if r.pqi.complete else f"{_fmt(r.pqi.partial_score)}*"
         row = [
             r.model,
-            _fmt(r.pqi.score),
+            pqi_cell,
             _fmt(c["realism"].value),
             _fmt(c["surface"].value),
             _fmt(c["memory"].value),
@@ -562,6 +454,12 @@ def compare(reports: Sequence[Report]) -> str:
         if has_mauve:
             row.append(_fmt(r.mauve.mauve) if r.mauve else "")
         lines.append("| " + " | ".join(row) + " |")
+    if any_partial:
+        lines.append("")
+        lines.append(
+            "\\* partial PQI: a component is missing (see each report's notes); "
+            "only comparable across rows missing the same component"
+        )
     return "\n".join(lines)
 
 
@@ -578,12 +476,6 @@ def _pct(value: float | None) -> str:
     if value is None or (isinstance(value, float) and math.isnan(value)):
         return "n/a"
     return f"{100 * value:.1f}%"
-
-
-def _config_dict(config: SuiteConfig) -> dict[str, Any]:
-    data = asdict(config)
-    data["pqi_weights"] = dict(config.pqi_weights)
-    return data
 
 
 def _jsonable(value: Any) -> Any:

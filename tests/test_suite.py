@@ -45,8 +45,9 @@ def test_reports_have_expected_structure(reports, held_out: list[str]) -> None:
         assert set(report.surface) == {"seq_rep_4", "compression_ratio"}
         assert set(report.name_usage) == {"callback_rate", "new_name_rate"}
         assert report.mauve is None
-        assert report.pqi.partial and report.pqi.missing == ["realism"]
-        assert 0.0 <= report.pqi.score <= 1.0
+        assert report.pqi.missing == ["realism"] and math.isnan(report.pqi.score)
+        assert 0.0 <= report.pqi.partial_score <= 1.0
+        assert report.judge is None
 
 
 def test_bigram_has_no_context_gain_and_induction_does(reports) -> None:
@@ -68,13 +69,17 @@ def test_report_exports(reports) -> None:
     data = json.loads(report.to_json())
     assert data["model"] == "induction"
     assert data["pqi"]["components"]["realism"]["value"] is None  # NaN -> null
+    assert data["pqi"]["score"] is None and data["pqi"]["partial_score"] > 0
     assert data["context_gain"]["8"]["gain_nats"] > 0
     markdown = report.to_markdown()
     assert markdown.startswith("## induction -- PQI")
     assert "LongPPL" in markdown and "name binding" in markdown
     table = compare(list(reports))
-    assert table.count("\n") == 3  # header, separator, two rows
-    assert table.index("| induction") < table.index("| bigram") or math.isnan(report.pqi.score)
+    rows = [line for line in table.splitlines() if line.startswith("| ")]
+    assert len(rows) == 3  # header + two models
+    assert "*" in rows[1] and "partial PQI" in table  # partial indices are marked
+    by_partial = sorted(reports, key=lambda r: -r.pqi.partial_score)
+    assert rows[1].startswith(f"| {by_partial[0].model} ")
     assert report.generation.examples(1).startswith("--- prompt")
 
 
@@ -97,4 +102,4 @@ def test_generation_skipped_when_documents_are_too_short(
     assert report.generation is None
     assert report.surface == {} and report.name_usage == {}
     assert any("generation skipped" in n for n in report.notes)
-    assert report.pqi.missing == ["realism", "surface"] or "surface" in report.pqi.missing
+    assert report.pqi.missing == ["realism", "surface"]

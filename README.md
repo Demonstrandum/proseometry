@@ -76,28 +76,55 @@ class MyModel(LogitsModel):
 Batching, right-padding, BOS handling, continuation scoring and nucleus sampling
 are implemented once in `Model`; override `generate` if you have a cached sampler.
 
-### 2. Run the suite
+### 2. Measure the PQI
 
-`Suite` holds the protocol. Run several models through the *same* suite and the
-reports -- including PQI -- are comparable.
+The Prose Quality Index is a fixed statistic of a model and a held-out corpus;
+nothing else goes in. One call measures everything it needs:
+
+```python
+from proseometry import PQIConfig, prose_quality_index
+
+held_out = open("valid.txt").read().split("<|endoftext|>")   # one string per document
+
+config = PQIConfig(
+    prompt_tokens=128, continuation_tokens=256,   # generation protocol
+    temperature=1.0, top_p=0.95,                  # one decoding for every model
+    binding_min_gap=64,                           # a name must be absent this long to count as a callback
+    mauve_featurizer="gpt2-large", mauve_device_id=0,
+)
+pqi = prose_quality_index(model, held_out, config)
+
+pqi.score                                 # in [0, 1]; NaN unless every component was measured
+pqi.components["memory"].value            # realism / surface / memory
+pqi.components["memory"].measures         # {"binding_skill": ..., "callback_rate_overlap": ..., ...}
+pqi.binding, pqi.surface, pqi.mauve       # the measurements it was computed from
+print(pqi.summary())                      # PQI 0.739 (realism 0.606, surface 0.787, memory 0.846)
+```
+
+Use the same `PQIConfig` and the same `held_out` for every model you compare.
+MAUVE is part of the definition, so `prose_quality_index` raises if `mauve-text`
+is not installed; `PQIConfig(mauve=False)` yields a *partial* index instead
+(`score` is NaN, `partial_score` holds the geometric mean of what is available).
+
+### 3. Run the full suite
+
+`Suite` computes the PQI plus the diagnostics that are deliberately *not* in it:
+bits per byte, the context-gain curve, LongPPL (with an evaluator model) and,
+optionally, an LLM judge. `SuiteConfig` extends `PQIConfig`.
 
 ```python
 from proseometry import Suite, SuiteConfig, compare
 
-held_out = open("valid.txt").read().split("<|endoftext|>")   # one string per document
-
 config = SuiteConfig(
+    prompt_tokens=128, continuation_tokens=256, binding_min_gap=64,
+    mauve_featurizer="gpt2-large", mauve_device_id=0,
     max_doc_tokens=1024,                 # teacher-forced metrics see this much of each document
     context_windows=(16, 64, 256),       # k for the context-gain curve
-    binding_min_gap=64,                  # a name must be absent this long to count as a callback
-    prompt_tokens=128, continuation_tokens=256,
-    temperature=1.0, top_p=0.95,         # one decoding for every model
-    mauve=True, mauve_featurizer="gpt2-large", mauve_device_id=0,
 )
 suite = Suite(
     config,
     evaluator=HFModel.from_pretrained("a/stronger-model", device="cuda"),  # optional: picks LongPPL key tokens
-    # judge=proseometry.judge.openai_compatible_judge("gpt-4o-mini"),      # optional: 1-5 rubric
+    # judge=proseometry.judge.openai_compatible_judge("gpt-4o-mini"),      # optional: 1-5 rubric, reported only
 )
 
 reports = [
@@ -111,17 +138,16 @@ The evaluator's key tokens are computed once per corpus and reused across
 `run` calls. `examples/hf_compare.py` wraps this in a CLI; `examples/toy_demo.py`
 runs the suite on dependency-free toy models in a few seconds.
 
-### 3. Read the report
+### 4. Read the report
 
 Every metric is a plain attribute with its human reference beside it:
 
 ```python
 report = reports[0]
 
-report.pqi.score                              # the index, in [0, 1]
-report.pqi.components["memory"].value         # realism / surface / memory
-report.pqi.components["memory"].measures      # {"binding_skill": ..., "callback_rate_overlap": ..., ...}
-report.pqi.partial, report.pqi.missing        # True and ["realism"] if e.g. MAUVE was unavailable
+report.pqi.score                              # the PQI (same object `prose_quality_index` returns)
+report.pqi.complete, report.pqi.missing       # False and ["realism"] if e.g. MAUVE was unavailable
+report.pqi.partial_score                      # geometric mean of the available components (diagnostic)
 
 report.likelihood.bits_per_byte, report.likelihood.perplexity
 report.context_gain[64].gain_nats, report.context_gain[64].ppl_reduction
@@ -131,6 +157,7 @@ report.binding.accuracy_interval()                               # bootstrap CI
 report.surface["seq_rep_4"].model_mean, report.surface["seq_rep_4"].human_mean, report.surface["seq_rep_4"].overlap
 report.name_usage["callback_rate"].overlap, report.name_usage["new_name_rate"].overlap
 report.mauve.mauve                                               # None if MAUVE was off or failed
+report.judge.mean("consistency")                                 # None unless a judge was configured; never in the PQI
 report.notes                                                     # protocol warnings (small samples, skipped metrics, ...)
 
 print(report.to_markdown())                   # human-readable table
@@ -138,13 +165,14 @@ open("run-17.json", "w").write(report.to_json())
 print(report.generation.examples(3))          # prompt / human / model triples -- always read some
 ```
 
-### 4. Use the metrics individually
+### 5. Use the metrics individually
 
 The suite is a thin orchestration layer; each metric is a function you can call
 on its own, which is useful inside a training loop or for a custom protocol.
 
 ```python
-from proseometry import likelihood, recall, degeneration, consistency, distribution, judge, quality
+from proseometry import likelihood, recall, degeneration, consistency, distribution, judge
+from proseometry import PQI, sample_continuations
 
 docs = [model.tokenize_doc(text, max_tokens=1024) for text in held_out]
 
@@ -171,43 +199,48 @@ binding.accuracy, binding.chance, binding.recency_accuracy, binding.skill
 binding.records[0].true_name, binding.records[0].candidates, binding.records[0].predicted
 
 # Generation side: sample continuations with paired human references.
-gen = Suite(SuiteConfig(prompt_tokens=128, continuation_tokens=256)).generate(model, docs)
+gen = sample_continuations(model, docs, prompt_tokens=128, continuation_tokens=256)
 surface = degeneration.compare_surface(gen.model, gen.human)                  # seq_rep_4, compression_ratio
 usage = consistency.compare_name_usage(gen.prompts, gen.model, gen.human,
                                        model_prompt_index=gen.prompt_index)   # callback_rate, new_name_rate
 degeneration.seq_rep_n(gen.model[0], n=4), degeneration.distinct_n(gen.model, n=2)
 
 # MAUVE from texts, or from features of any encoder you prefer.
-mauve = distribution.mauve_score(
-    [p + h for p, h in zip(gen.prompts, gen.human)],
-    [p + m for p, m in zip(gen.model_prompts(), gen.model)],
-    featurize_model_name="gpt2-large", device_id=0,
-)
+mauve = distribution.mauve_score(gen.human_full(), gen.model_full(),
+                                 featurize_model_name="gpt2-large", device_id=0)
 mauve = distribution.mauve_from_features(human_features, model_features)      # [n, d] arrays
 
-# Judge: any callable prompt -> completion.
+# The PQI from pieces you already have (same definition as prose_quality_index).
+pqi = PQI.from_measurements(binding=binding, surface=surface, name_usage=usage, mauve=mauve)
+
+# Judge: any callable prompt -> completion. A diagnostic, not part of the PQI.
 graded = judge.judge_continuations(judge.openai_compatible_judge("gpt-4o-mini"),
                                    gen.model_prompts(), gen.model)
 graded.mean("consistency"), graded.normalized("coherence")
 ```
 
-### 5. Build your own index
+### 6. Build your own index
 
-`prose_quality_index` takes any sub-measures in `[0, 1]` grouped into the three
-components, so you can add a metric of your own or reweight the axes:
+The PQI is a fixed instance of `CompositeIndex`: components that are arithmetic
+means of `[0, 1]` measures, combined by a geometric mean. `composite_index`
+exposes the same machinery for an index of your own design:
 
 ```python
-pqi = quality.prose_quality_index(
-    realism={"mauve": mauve.mauve, "judge_coherence": graded.normalized("coherence")},
-    surface={f"{k}_overlap": v.overlap for k, v in surface.items()},
-    memory={"binding_skill": binding.skill, **{f"{k}_overlap": v.overlap for k, v in usage.items()}},
-    weights={"realism": 1.0, "surface": 1.0, "memory": 2.0},
+from proseometry import composite_index
+
+mine = composite_index(
+    {
+        "realism": {"mauve": mauve.mauve},
+        "memory": {"binding_skill": binding.skill, "consistency": graded.normalized("consistency")},
+        "style": {"sentence_length_overlap": my_overlap},
+    },
+    weights={"realism": 1.0, "memory": 2.0, "style": 1.0},
 )
-pqi.score, pqi.summary()
+mine.score, mine.summary("my-index")
 ```
 
 `degeneration.compare_statistic(name, fn, model_texts, human_texts)` turns any
-per-sample function into a human-overlap sub-measure.
+per-sample function into a human-overlap measure for it.
 
 ## The metrics
 
@@ -227,13 +260,14 @@ reference.
 | **seq-rep-4, compression ratio** | Per-sample repeated-4-gram fraction (Welleck et al. 2020) and zlib ratio of generated text, compared with the human continuations by **overlap = 1 - KS**. | Free-running degeneration -- in *both* directions: looping and word salad. |
 | **Callback / new-name rate** | Per 100 words of continuation: mentions of prompt characters, and distinct names never seen in the prompt; overlap with human continuations. | Generation-side memory: inventing a new protagonist, or parroting one. |
 | **MAUVE** (Pillutla et al. 2021) | Divergence-frontier gap between model and human text in a GPT-2 embedding space; penalises text people never write and modes the model cannot produce. | "Does it read like a person wrote it" -- the semantic nonsense that surface statistics miss. |
-| **Judge** (optional) | Fixed 1-5 rubric for grammar, coherence and consistency with the opening (Eldan & Li 2023), via any `Callable[[str], str]`. | Same as MAUVE, with a human-readable rationale; useful to spot-check. |
+| **Judge** (optional, suite only) | Fixed 1-5 rubric for grammar, coherence and consistency with the opening (Eldan & Li 2023), via any `Callable[[str], str]`. | A spot-check with a human-readable rationale. Reported beside the PQI, never inside it. |
 
 ## The Prose Quality Index
 
-PQI answers "is this sensible text that uses its context?" with one number built
-only from measurements that do not share perplexity's blind spots. Two rules make
-the combination meaningful rather than a weighted soup:
+PQI answers "is this sensible text that uses its context?" with one number. It is
+a **fixed statistic**: a definite set of measurements, combined in a definite way,
+computable from a model and a held-out corpus alone (`prose_quality_index`).
+Two rules make the combination meaningful rather than a weighted soup:
 
 1. **Every sub-measure lives in [0, 1] and 1 means human level.** Distributional
    measures are *indistinguishability from human text* on some view (MAUVE; the
@@ -247,28 +281,41 @@ the combination meaningful rather than a weighted soup:
 
 | Component | Sub-measures | Property |
 |---|---|---|
-| `realism` | MAUVE; judge coherence (if a judge is configured) | reads like human text |
+| `realism` | MAUVE between `prompt + continuation` texts | reads like human text |
 | `surface` | seq-rep-4 overlap; compression-ratio overlap | human repetition / entropy profile |
-| `memory` | name-binding skill; callback-rate overlap; new-name-rate overlap; judge consistency | uses and retains what came before |
+| `memory` | name-binding skill; callback-rate overlap; new-name-rate overlap | uses and retains what came before |
 
 $$
-\mathrm{PQI} = \exp\Big(\sum_c w_c \ln \max(\bar m_c, \epsilon)\Big), \qquad \sum_c w_c = 1
+\mathrm{PQI} = \Big(\prod_{c \in \{\text{realism},\ \text{surface},\ \text{memory}\}} \max(\bar m_c,\ \epsilon)\Big)^{1/3}
 $$
 
-with $\bar m_c$ the mean of the available sub-measures of component $c$, equal
-weights by default, and a floor $\epsilon = 0.01$ so that a total failure on one
-axis still leaves the ordering carried by the others. A component with no
-available sub-measure (e.g. MAUVE not installed) is skipped and the report is
-marked **partial** -- a partial PQI is blind on that axis, exactly like
-perplexity is, so treat it as such.
+with $\bar m_c$ the mean of component $c$'s sub-measures and a floor
+$\epsilon = 0.01$ so that a total failure on one axis still leaves the ordering
+carried by the others.
+
+A PQI is complete or it is not. If any component could not be measured (MAUVE
+not installed, no document long enough to prompt, no recurring names) `score` is
+NaN and `missing` says why; `partial_score` gives the geometric mean of what is
+available for diagnostics, and partial indices are only comparable when they
+miss the same component. The definition is never silently narrowed.
+
+**What is deliberately left out.** *Context gain* and *LongPPL* are reported by
+the suite but are not in the index: the first has no human-level anchor in
+[0, 1]; the second needs an external evaluator model, so it is not a function of
+the model and corpus alone. *LLM-judge* scores are excluded because they are
+expensive, depend on a third-party model and prompt, and are not a formal
+statistic; the suite can still report them beside the index. Bits per byte is
+the thing PQI exists to complement.
 
 How to read it: a repetitive low-perplexity model scores well on `memory` and
 badly on `surface`/`realism`; a fluent model that forgets its characters scores
 well on `realism` and badly on `memory`; the geometric mean ranks both below a
 model that is merely decent on everything. PQI is for **ranking models under one
-fixed protocol** (same held-out texts, prompt/continuation lengths, decoding
-settings, sample counts, MAUVE featuriser). Its absolute value moves with those
-choices, which is why the components are always reported next to it.
+fixed protocol** (`PQIConfig`: same held-out texts, prompt/continuation lengths,
+decoding settings, sample counts, MAUVE featuriser). Its absolute value moves
+with those choices, which is why the components are always reported next to it.
+`CompositeIndex` / `composite_index` is the generic machinery underneath, for
+indices of your own.
 
 ## Example: TinyStories-1M vs TinyStories-33M
 
