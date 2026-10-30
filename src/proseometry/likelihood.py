@@ -105,6 +105,16 @@ class LikelihoodSummary:
         return bootstrap_mean(self.per_doc_bits_per_byte, seed=seed)
 
 
+def _doc_nll_bytes(doc: TokenizedDoc, full: np.ndarray) -> tuple[float, int, int]:
+    """``(nll_sum, n_tokens, n_bytes)`` over the scored tokens of one document."""
+    mask = ~np.isnan(full)
+    if not mask.any():
+        return 0.0, 0, 0
+    first = int(np.argmax(mask))
+    n_bytes = len(doc.text[doc.spans[first][0] :].encode("utf-8"))
+    return float(-np.sum(full[mask])), int(mask.sum()), n_bytes
+
+
 def likelihood_summary(scores: Sequence[ContextScores]) -> LikelihoodSummary:
     """Aggregate full-context scores into bits per byte and per-token perplexity.
 
@@ -116,18 +126,27 @@ def likelihood_summary(scores: Sequence[ContextScores]) -> LikelihoodSummary:
     n_bytes = 0
     per_doc: list[float] = []
     for sc in scores:
-        mask = sc.scored
-        if not mask.any():
+        doc_nll, doc_tokens, doc_bytes = _doc_nll_bytes(sc.doc, sc.full)
+        if doc_tokens == 0:
             continue
-        first = int(np.argmax(mask))
-        text = sc.doc.text[sc.doc.spans[first][0] :]
-        doc_bytes = len(text.encode("utf-8"))
-        doc_nll = float(-np.sum(sc.full[mask]))
         nll_sum += doc_nll
-        n_tokens += int(mask.sum())
+        n_tokens += doc_tokens
         n_bytes += doc_bytes
         per_doc.append(doc_nll / (doc_bytes * math.log(2)) if doc_bytes else math.nan)
     return LikelihoodSummary(nll_sum, n_tokens, n_bytes, len(per_doc), per_doc)
+
+
+def bits_per_byte(
+    model: Model, texts: Sequence[str], *, max_tokens: int | None = None
+) -> np.ndarray:
+    """Full-context bits per byte of each text under ``model`` (batched; ``NaN`` if empty)."""
+    docs = [model.tokenize_doc(t, max_tokens) for t in texts]
+    out = np.full(len(docs), np.nan, dtype=np.float64)
+    for i, (doc, full) in enumerate(zip(docs, model.score([d.ids for d in docs]), strict=True)):
+        nll, n_tokens, n_bytes = _doc_nll_bytes(doc, full)
+        if n_tokens and n_bytes:
+            out[i] = nll / (n_bytes * math.log(2))
+    return out
 
 
 # --------------------------------------------------------------------------- context gain

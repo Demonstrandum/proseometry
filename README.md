@@ -37,6 +37,68 @@ Inside the checkout: `uv sync --all-extras` and `uv run pytest`.
 
 ## Usage as a library
 
+Three entry points, from quick to thorough: `goodness(text)` scores one
+generated text with no model at hand; `prose_quality_index(model, texts)` is
+the PQI, a fixed statistic of a model on a held-out corpus; `Suite` adds every
+diagnostic around it.
+
+### 0. Just score a text
+
+```python
+from proseometry import goodness
+
+g = goodness(some_generated_text)
+g.score          # 1.0 = typical human prose on every check; 0.0 = fails a check completely
+g.weakest        # the check that set the score, e.g. "seq_rep_4"
+g.typicality     # per check, in [0, 1]      g.p_values / g.values for the raw numbers
+print(g.summary())
+# goodness 0.199 (weakest: seq_rep_4; seq_rep_4 0.20, compression_ratio 1.00, sentence_length 1.00, ...)
+```
+
+With no model and no paired human reference, the only principled question left
+is *how typical is this text of human prose?* Each check is a text statistic
+with a declared failure direction -- `seq_rep_4` (loops), `compression_ratio`
+(word salad), `sentence_length` (fragments / run-ons, two-sided),
+`new_name_rate` (a new character every sentence), `name_reuse` (never returning
+to one) -- scored by the empirical p-value of the text's value against human
+windows of the same length, divided by the conventional α = 0.05 and capped at
+1. Anything inside the typical 95% of human text scores 1; the extreme tail
+decays to 0. The score is the **weakest check**: each is a separate
+disqualifier, so adding checks can only make the test stricter.
+
+Text statistics cannot see meaning, so there is an optional **fluency check**:
+bits per byte under a small reference LM (GPT-2), scored the same way.
+
+```python
+goodness(text, fluency=True)                       # loads GPT-2 once; needs proseometry[torch]
+goodness_many(texts, fluency=True)                 # batched; mean_goodness(results) for a model-level number
+```
+
+The shipped reference is broad (14 public-domain novels balanced against simple
+children's stories), which makes it lenient. **Calibrate to your domain for
+anything serious** -- a few hundred human texts, seconds to build:
+
+```python
+from proseometry import Reference, default_scorer
+
+ref = Reference.from_texts(my_human_texts, lengths=(50, 100, 200, 400))             # text checks only
+ref = Reference.from_texts(my_human_texts, scorer=default_scorer())                 # + fluency under GPT-2
+ref = Reference.from_texts(my_human_texts, scorer=my_model)                         # + fluency under any Model
+ref.save("my_reference.json"); ref = Reference.load("my_reference.json")
+
+goodness(text, ref, scorer=default_scorer())
+```
+
+What to expect (150 stories generated from scratch per model, GPT-2 fluency,
+reference calibrated on TinyStories): TinyStories-1M **0.65** (46% of texts
+pass every check), TinyStories-33M **0.93** (87%), human openings **0.90**
+(80%). The 33M model is indistinguishable from people; the 1M model is flagged
+mostly by `bits_per_byte`. Under the broad default reference the ordering holds
+but the gap shrinks (0.93 / 0.98 / 0.96); text-only checks cannot separate
+them at all (0.97 / 0.98 / 0.96), because the 1M model's failure is semantic.
+A single ~100-word text is a noisy sample, so average over many; and read what
+`weakest` flags.
+
 ### 1. Wrap your model
 
 Everything is written against `proseometry.Model`: a language model plus its
@@ -261,6 +323,7 @@ reference.
 | **Callback / new-name rate** | Per 100 words of continuation: mentions of prompt characters, and distinct names never seen in the prompt; overlap with human continuations. | Generation-side memory: inventing a new protagonist, or parroting one. |
 | **MAUVE** (Pillutla et al. 2021) | Divergence-frontier gap between model and human text in a GPT-2 embedding space; penalises text people never write and modes the model cannot produce. | "Does it read like a person wrote it" -- the semantic nonsense that surface statistics miss. |
 | **Judge** (optional, suite only) | Fixed 1-5 rubric for grammar, coherence and consistency with the opening (Eldan & Li 2023), via any `Callable[[str], str]`. | A spot-check with a human-readable rationale. Reported beside the PQI, never inside it. |
+| **goodness(text)** | Per-text typicality of repetition, compressibility, sentence length, name churn and reuse -- and optionally bits/byte under GPT-2 -- against human windows of the same length; the weakest check wins. | Scoring a single generated text when no model or paired reference is at hand. |
 
 ## The Prose Quality Index
 
@@ -378,7 +441,8 @@ trusting any number.
 
 ```sh
 uv sync --all-extras
-uv run pytest           # 52 tests; the Hugging Face adapter test downloads a tiny checkpoint
+uv run pytest           # 64 tests; two network tests download tiny checkpoints
+uv run python scripts/build_reference.py   # rebuild the goodness() reference (downloads public-domain text + GPT-2)
 uv run ruff check src tests examples && uv run ruff format --check src tests examples
 ```
 
