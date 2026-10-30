@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+
+# uv / virtual environments
+.venv/
+
+# Tooling caches
+.pytest_cache/
+.ruff_cache/
+
+# Evaluation outputs
+reports/
