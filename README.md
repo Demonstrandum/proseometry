@@ -35,41 +35,179 @@ uv add "proseometry[all] @ git+https://github.com/Demonstrandum/proseometry"
 
 Inside the checkout: `uv sync --all-extras` and `uv run pytest`.
 
-## Quick start
+## Usage as a library
+
+### 1. Wrap your model
+
+Everything is written against `proseometry.Model`: a language model plus its
+tokenizer and scoring conventions (BOS/EOS ids, context limit, batch size).
+
+```python
+from proseometry.adapters import HFModel, TorchModel
+
+# A Hugging Face checkpoint (local path or hub id). BOS/EOS and the context limit
+# are read from the tokenizer and config; pass them explicitly to override.
+model = HFModel.from_pretrained("ckpt/run-17", name="run-17", device="cuda")
+model = HFModel(hf_model, hf_tokenizer, name="run-17")          # already-loaded objects
+
+# Any PyTorch module whose forward pass returns [B, T, V] logits (or an object
+# with `.logits`). The tokenizer only needs encode(str) -> list[int] and decode(ids) -> str.
+model = TorchModel(module, tokenizer, name="run-17", bos_id=1, eos_id=2, max_context=2048)
+model = TorchModel(module, tokenizer, forward=lambda m, ids: m(ids, mask=None)[0])  # custom call
+```
+
+For anything else (JAX, a numpy n-gram, a remote model) subclass `LogitsModel`
+and return logits, or subclass `Model` and implement `_token_logprobs` and
+`_next_token_logits`:
+
+```python
+import numpy as np
+from proseometry import LogitsModel
+
+class MyModel(LogitsModel):
+    def __init__(self, net, tokenizer):
+        super().__init__(tokenizer, name="mine", bos_id=1, eos_id=2, max_context=1024)
+        self.net = net
+
+    def logits(self, ids: np.ndarray) -> np.ndarray:   # int64 [B, T] -> float [B, T, V]
+        return self.net(ids)
+```
+
+Batching, right-padding, BOS handling, continuation scoring and nucleus sampling
+are implemented once in `Model`; override `generate` if you have a cached sampler.
+
+### 2. Run the suite
+
+`Suite` holds the protocol. Run several models through the *same* suite and the
+reports -- including PQI -- are comparable.
 
 ```python
 from proseometry import Suite, SuiteConfig, compare
-from proseometry.adapters import HFModel
 
-held_out = open("valid.txt").read().split("<|endoftext|>")
+held_out = open("valid.txt").read().split("<|endoftext|>")   # one string per document
 
-suite = Suite(
-    SuiteConfig(prompt_tokens=64, continuation_tokens=128, context_windows=(8, 32, 128)),
-    evaluator=HFModel.from_pretrained("a/stronger-model"),   # optional: selects LongPPL key tokens
+config = SuiteConfig(
+    max_doc_tokens=1024,                 # teacher-forced metrics see this much of each document
+    context_windows=(16, 64, 256),       # k for the context-gain curve
+    binding_min_gap=64,                  # a name must be absent this long to count as a callback
+    prompt_tokens=128, continuation_tokens=256,
+    temperature=1.0, top_p=0.95,         # one decoding for every model
+    mauve=True, mauve_featurizer="gpt2-large", mauve_device_id=0,
 )
+suite = Suite(
+    config,
+    evaluator=HFModel.from_pretrained("a/stronger-model", device="cuda"),  # optional: picks LongPPL key tokens
+    # judge=proseometry.judge.openai_compatible_judge("gpt-4o-mini"),      # optional: 1-5 rubric
+)
+
 reports = [
     suite.run(HFModel.from_pretrained(path, name=name, device="cuda"), held_out)
     for name, path in {"run-17": "ckpt/17", "run-23": "ckpt/23"}.items()
 ]
-for report in reports:
-    print(report.to_markdown())          # every metric with the human reference beside it
-    print(report.generation.examples(2)) # read a few continuations: always do this
-print(compare(reports))                  # one table, sorted by PQI
+print(compare(reports))                      # one markdown table, sorted by PQI
 ```
 
-`examples/hf_compare.py` wraps this in a CLI; `examples/toy_demo.py` runs the
-suite on dependency-free toy models in a few seconds.
+The evaluator's key tokens are computed once per corpus and reused across
+`run` calls. `examples/hf_compare.py` wraps this in a CLI; `examples/toy_demo.py`
+runs the suite on dependency-free toy models in a few seconds.
 
-Your own PyTorch model needs one line:
+### 3. Read the report
+
+Every metric is a plain attribute with its human reference beside it:
 
 ```python
-from proseometry.adapters import TorchModel
-model = TorchModel(module, tokenizer, name="run-17", bos_id=1, eos_id=2, max_context=2048)
+report = reports[0]
+
+report.pqi.score                              # the index, in [0, 1]
+report.pqi.components["memory"].value         # realism / surface / memory
+report.pqi.components["memory"].measures      # {"binding_skill": ..., "callback_rate_overlap": ..., ...}
+report.pqi.partial, report.pqi.missing        # True and ["realism"] if e.g. MAUVE was unavailable
+
+report.likelihood.bits_per_byte, report.likelihood.perplexity
+report.context_gain[64].gain_nats, report.context_gain[64].ppl_reduction
+report.long_ppl.long_ppl, report.long_ppl.key_fraction          # None without an evaluator
+report.binding.accuracy, report.binding.chance, report.binding.recency_accuracy, report.binding.skill
+report.binding.accuracy_interval()                               # bootstrap CI
+report.surface["seq_rep_4"].model_mean, report.surface["seq_rep_4"].human_mean, report.surface["seq_rep_4"].overlap
+report.name_usage["callback_rate"].overlap, report.name_usage["new_name_rate"].overlap
+report.mauve.mauve                                               # None if MAUVE was off or failed
+report.notes                                                     # protocol warnings (small samples, skipped metrics, ...)
+
+print(report.to_markdown())                   # human-readable table
+open("run-17.json", "w").write(report.to_json())
+print(report.generation.examples(3))          # prompt / human / model triples -- always read some
 ```
 
-`module(ids)` must return `[B, T, V]` logits (or an object with `.logits`); pass
-`forward=lambda m, ids: ...` otherwise. The tokenizer only needs `encode`/`decode`.
-Anything else can subclass `proseometry.Model` and implement two array methods.
+### 4. Use the metrics individually
+
+The suite is a thin orchestration layer; each metric is a function you can call
+on its own, which is useful inside a training loop or for a custom protocol.
+
+```python
+from proseometry import likelihood, recall, degeneration, consistency, distribution, judge, quality
+
+docs = [model.tokenize_doc(text, max_tokens=1024) for text in held_out]
+
+# Teacher-forced: one full-context pass plus one pass per short window k.
+scores = [likelihood.context_scores(model, doc, ks=(16, 64, 256)) for doc in docs]
+summary = likelihood.likelihood_summary(scores)          # .bits_per_byte, .perplexity, .n_tokens
+gain = likelihood.context_gain(scores, k=64)             # .gain_nats, .ppl_reduction, .interval()
+lsd = scores[0].lsd(64)                                  # per-token long-short difference, if you want the raw curve
+
+# LongPPL: let a stronger evaluator pick key tokens, transfer them by character span.
+ev_docs = [evaluator.tokenize_doc(text, max_tokens=1024) for text in held_out]
+ev_scores = [likelihood.context_scores(evaluator, doc, ks=(64,)) for doc in ev_docs]
+spans = [
+    likelihood.key_spans(doc, likelihood.key_token_mask(sc, k=64, alpha=2.0, beta=-2.0))
+    for doc, sc in zip(ev_docs, ev_scores)
+]
+long = likelihood.long_ppl(
+    (sc.full, likelihood.mask_from_spans(sc.doc, span)) for sc, span in zip(scores, spans)
+)                                                        # .long_ppl, .n_key_tokens, .key_fraction
+
+# Name binding: which character comes back after a long gap?
+binding = recall.name_binding(model, docs, min_gap=64, max_positions_per_doc=32)
+binding.accuracy, binding.chance, binding.recency_accuracy, binding.skill
+binding.records[0].true_name, binding.records[0].candidates, binding.records[0].predicted
+
+# Generation side: sample continuations with paired human references.
+gen = Suite(SuiteConfig(prompt_tokens=128, continuation_tokens=256)).generate(model, docs)
+surface = degeneration.compare_surface(gen.model, gen.human)                  # seq_rep_4, compression_ratio
+usage = consistency.compare_name_usage(gen.prompts, gen.model, gen.human,
+                                       model_prompt_index=gen.prompt_index)   # callback_rate, new_name_rate
+degeneration.seq_rep_n(gen.model[0], n=4), degeneration.distinct_n(gen.model, n=2)
+
+# MAUVE from texts, or from features of any encoder you prefer.
+mauve = distribution.mauve_score(
+    [p + h for p, h in zip(gen.prompts, gen.human)],
+    [p + m for p, m in zip(gen.model_prompts(), gen.model)],
+    featurize_model_name="gpt2-large", device_id=0,
+)
+mauve = distribution.mauve_from_features(human_features, model_features)      # [n, d] arrays
+
+# Judge: any callable prompt -> completion.
+graded = judge.judge_continuations(judge.openai_compatible_judge("gpt-4o-mini"),
+                                   gen.model_prompts(), gen.model)
+graded.mean("consistency"), graded.normalized("coherence")
+```
+
+### 5. Build your own index
+
+`prose_quality_index` takes any sub-measures in `[0, 1]` grouped into the three
+components, so you can add a metric of your own or reweight the axes:
+
+```python
+pqi = quality.prose_quality_index(
+    realism={"mauve": mauve.mauve, "judge_coherence": graded.normalized("coherence")},
+    surface={f"{k}_overlap": v.overlap for k, v in surface.items()},
+    memory={"binding_skill": binding.skill, **{f"{k}_overlap": v.overlap for k, v in usage.items()}},
+    weights={"realism": 1.0, "surface": 1.0, "memory": 2.0},
+)
+pqi.score, pqi.summary()
+```
+
+`degeneration.compare_statistic(name, fn, model_texts, human_texts)` turns any
+per-sample function into a human-overlap sub-measure.
 
 ## The metrics
 
@@ -185,23 +323,15 @@ trusting any number.
   featurisation to a subprocess when `faiss`/`sklearn` were imported before `torch`,
   so a long run cannot be lost at the last step. `isolate=False` turns this off.
 
-## Extending
-
-* **Any model:** subclass `Model` and implement `_token_logprobs(ids) -> [B, T-1]`
-  and `_next_token_logits(ids) -> [B, V]` (or `LogitsModel.logits(ids) -> [B, T, V]`
-  in numpy). Override `generate` if you have a cached sampler.
-* **Any judge:** `Suite(..., judge=fn)` with `fn(prompt) -> str`;
-  `judge.openai_compatible_judge(model=...)` builds one for OpenAI-style endpoints
-  and reads the key from an environment variable at call time.
-* **Any statistic:** `degeneration.compare_statistic(name, fn, model_texts, human_texts)`
-  gives the overlap for any per-sample function, and `quality.prose_quality_index`
-  accepts arbitrary sub-measure dictionaries.
+* **Judge credentials.** `judge.openai_compatible_judge(model, base_url=..., api_key_env=...)`
+  reads the API key from an environment variable at call time and never stores
+  it; it works with any OpenAI-style `/chat/completions` server (vLLM, Ollama, ...).
 
 ## Development
 
 ```sh
 uv sync --all-extras
-uv run pytest           # 51 tests; the Hugging Face adapter test downloads a tiny checkpoint
+uv run pytest           # 52 tests; the Hugging Face adapter test downloads a tiny checkpoint
 uv run ruff check src tests examples && uv run ruff format --check src tests examples
 ```
 
